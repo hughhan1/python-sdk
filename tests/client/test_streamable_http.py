@@ -8,7 +8,7 @@ that the public client never exposes.
 import base64
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import httpx2
@@ -38,6 +38,8 @@ from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 
 from mcp import Client, MCPError
+from mcp.client.auth import OAuthFlowError
+from mcp.client.session import IncomingMessage
 from mcp.client.streamable_http import (
     MAX_RECONNECTION_ATTEMPTS,
     RequestContext,
@@ -56,6 +58,111 @@ from mcp.shared.message import ClientMessageMetadata, ServerMessageMetadata, Ses
 from mcp.shared.transport_context import TransportContext
 from tests.interaction.transports import StreamingASGITransport
 from tests.shared.test_dispatcher import Recorder, echo_handlers
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["connect", "oauth", "body"])
+async def test_http_failure_reaches_only_its_caller_and_the_client_remains_usable(
+    failure: Literal["connect", "oauth", "body"],
+) -> None:
+    """SDK-defined: local HTTP/OAuth failures preserve the exception and leave sibling calls and cleanup usable.
+
+    The HTTP seam injects failures that a healthy in-process MCP server cannot produce.
+    """
+    error = {
+        "connect": httpx2.ConnectError("connection refused"),
+        "oauth": OAuthFlowError("authorization failed"),
+        "body": httpx2.ReadError("response interrupted"),
+    }[failure]
+    sibling_started, failure_received = anyio.Event(), anyio.Event()
+
+    async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[Tool(name=name, input_schema={"type": "object"}) for name in ("fail", "sibling", "ok")]
+        )
+
+    async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+        assert params.name in {"sibling", "ok"}
+        if params.name == "sibling":
+            sibling_started.set()
+            await failure_received.wait()
+        return CallToolResult(content=[TextContent(text=params.name)])
+
+    manager = StreamableHTTPSessionManager(
+        app=Server("request-errors", on_list_tools=list_tools, on_call_tool=call_tool), json_response=True
+    )
+    app = Starlette(routes=[Mount("/mcp", app=manager.handle_request)])
+
+    async def broken_body() -> AsyncIterator[bytes]:
+        yield b'{"jsonrpc":'
+        raise error
+
+    async def handle(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        if body["method"] == "tools/call" and body["params"]["name"] == "fail":
+            await sibling_started.wait()
+            if failure == "body":
+                return httpx2.Response(200, content=broken_body(), headers={"content-type": "application/json"})
+            raise error
+        return await asgi.handle_async_request(request)
+
+    with anyio.fail_after(5):
+        async with (
+            manager.run(),
+            httpx2.ASGITransport(app=app) as asgi,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as http,
+            Client(
+                streamable_http_client("http://localhost/mcp", http_client=http), mode=LATEST_MODERN_VERSION
+            ) as client,
+        ):
+            await client.list_tools()
+
+            async def sibling() -> None:
+                assert (await client.call_tool("sibling", {})).content == [TextContent(text="sibling")]
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(sibling)
+                with pytest.raises(type(error)) as exc_info:
+                    await client.call_tool("fail", {})
+                assert exc_info.value is error
+                failure_received.set()
+            assert (await client.call_tool("ok", {})).content == [TextContent(text="ok")]
+
+
+@pytest.mark.anyio
+async def test_http_notification_failure_is_reported_without_stopping_subsequent_requests() -> None:
+    """SDK-defined: a one-way HTTP failure reaches the message observer without closing the client."""
+    error = httpx2.ConnectError("connection refused")
+    observed = anyio.Event()
+
+    async def observe(message: IncomingMessage) -> None:
+        assert message is error
+        observed.set()
+
+    async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+        return ListToolsResult(tools=[Tool(name="ok", input_schema={"type": "object"})])
+
+    manager = StreamableHTTPSessionManager(
+        app=Server("notification-errors", on_list_tools=list_tools), json_response=True, stateless=True
+    )
+    app = Starlette(routes=[Mount("/mcp", app=manager.handle_request)])
+
+    async def handle(request: httpx2.Request) -> httpx2.Response:
+        if request.method == "POST" and json.loads(request.content)["method"] == "notifications/initialized":
+            raise error
+        return await asgi.handle_async_request(request)
+
+    with anyio.fail_after(5):
+        async with (
+            manager.run(),
+            httpx2.ASGITransport(app=app) as asgi,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as http,
+            Client(
+                streamable_http_client("http://localhost/mcp", http_client=http), mode="legacy", message_handler=observe
+            ) as client,
+        ):
+            await observed.wait()
+            assert (await client.list_tools()).tools == [Tool(name="ok", input_schema={"type": "object"})]
 
 
 @pytest.mark.anyio

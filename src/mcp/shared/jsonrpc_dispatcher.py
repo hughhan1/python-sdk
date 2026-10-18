@@ -56,6 +56,7 @@ from mcp.shared.exceptions import MCPError, NoBackChannelError
 from mcp.shared.message import (
     ClientMessageMetadata,
     MessageMetadata,
+    RequestError,
     ServerMessageMetadata,
     SessionMessage,
 )
@@ -124,8 +125,8 @@ def cancelled_request_id_from_params(params: Mapping[str, Any] | None) -> Reques
 class _Pending:
     """An outbound request awaiting its response."""
 
-    send: MemoryObjectSendStream[dict[str, Any] | ErrorData]
-    receive: MemoryObjectReceiveStream[dict[str, Any] | ErrorData]
+    send: MemoryObjectSendStream[dict[str, Any] | ErrorData | Exception]
+    receive: MemoryObjectReceiveStream[dict[str, Any] | ErrorData | Exception]
     on_progress: ProgressFnT | None = None
 
 
@@ -366,7 +367,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
 
         # buffer=1: a close signal can arrive before the waiter parks in receive();
         # a WouldBlock later just means the waiter already has its one outcome.
-        send, receive = anyio.create_memory_object_stream[dict[str, Any] | ErrorData](1)
+        send, receive = anyio.create_memory_object_stream[dict[str, Any] | ErrorData | Exception](1)
         pending = _Pending(send=send, receive=receive, on_progress=on_progress)
         self._pending[pending_key] = pending
 
@@ -459,6 +460,8 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
 
         if isinstance(outcome, ErrorData):
             raise MCPError(code=outcome.code, message=outcome.message, data=outcome.data)
+        if isinstance(outcome, Exception):
+            raise outcome
         return outcome
 
     async def notify(
@@ -552,6 +555,9 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         Only `inline_methods` requests and the `on_stream_exception` observer
         are awaited; any other `await` would head-of-line block the read loop.
         """
+        if isinstance(item, RequestError):
+            self._resolve_pending(item.request_id, item.error)
+            return
         if isinstance(item, Exception):
             if self.on_stream_exception is None:
                 logger.debug("transport yielded exception: %r", item)
@@ -675,7 +681,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         )
         self._spawn(_contained_notify(on_notify), dctx, msg.method, msg.params, sender_ctx=sender_ctx)
 
-    def _resolve_pending(self, request_id: RequestId | None, outcome: dict[str, Any] | ErrorData) -> None:
+    def _resolve_pending(self, request_id: RequestId | None, outcome: dict[str, Any] | ErrorData | Exception) -> None:
         pending = self._pending.get(coerce_request_id(request_id)) if request_id is not None else None
         if pending is None:
             logger.debug("dropping response for unknown/late request id %r", request_id)

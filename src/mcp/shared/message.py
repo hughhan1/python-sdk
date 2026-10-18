@@ -56,6 +56,14 @@ MessageMetadata = ClientMessageMetadata | ServerMessageMetadata | None
 
 
 @dataclass
+class RequestError(Exception):
+    """Transport-local failure correlated to one request; never serialized onto the wire."""
+
+    request_id: RequestId
+    error: Exception
+
+
+@dataclass
 class SessionMessage:
     """A message with specific metadata for transport-specific features."""
 

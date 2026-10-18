@@ -42,7 +42,7 @@ from mcp.shared._httpx_utils import (
 )
 from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from mcp.shared.jsonrpc_dispatcher import cancelled_request_id_from_params
-from mcp.shared.message import ClientMessageMetadata, SessionMessage
+from mcp.shared.message import ClientMessageMetadata, RequestError, SessionMessage
 
 logger = logging.getLogger(__name__)
 
@@ -655,11 +655,17 @@ class StreamableHTTPTransport:
                         read_stream_writer=read_stream_writer,
                     )
 
-                    async def handle_request_async():
-                        if is_resumption:
-                            await self._handle_resumption_request(ctx)
-                        else:
-                            await self._handle_post_request(ctx)
+                    async def handle_request_async() -> None:
+                        try:
+                            if is_resumption:
+                                await self._handle_resumption_request(ctx)
+                            else:
+                                await self._handle_post_request(ctx)
+                        except Exception as exc:
+                            logger.exception("HTTP message failed")
+                            error = RequestError(message.id, exc) if isinstance(message, JSONRPCRequest) else exc
+                            with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+                                await read_stream_writer.send(error)
 
                     # If this is a request, start a new task to handle it
                     if isinstance(message, JSONRPCRequest):
