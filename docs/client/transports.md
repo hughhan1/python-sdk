@@ -41,6 +41,12 @@ Two things to notice:
 
 Keep the `timeout=`. It is the one the SDK's own client uses (30 seconds, 300 for reads); an `httpx2.AsyncClient` built without one gets `httpx2`'s 5-second default, and a tool call that runs longer than that fails with a read timeout.
 
+A local POST failure, such as an OAuth error, connection failure, or interrupted JSON response,
+raises the original exception in the affected call. Other in-flight calls and the client remain
+usable. The SDK does not replay the failed request; the caller decides whether to retry. Caller
+cancellation still propagates as cancellation. A failed protocol-discovery POST does not trigger
+a legacy handshake.
+
 One TLS note: `httpx2` verifies certificates against the operating system trust store (via
 [`truststore`](https://pypi.org/project/truststore/)), not a bundled CA list. In an environment with
 no usable system CA store (some minimal containers), set the standard `SSL_CERT_FILE`/`SSL_CERT_DIR`

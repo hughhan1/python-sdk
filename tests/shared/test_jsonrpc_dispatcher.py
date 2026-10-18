@@ -1841,7 +1841,7 @@ def test_resolve_pending_drops_outcome_when_waiter_stream_already_closed():
     c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](1)
     s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](1)
     d: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(s2c_recv, c2s_send)
-    send, recv = anyio.create_memory_object_stream[dict[str, Any] | ErrorData](1)
+    send, recv = anyio.create_memory_object_stream[dict[str, Any] | ErrorData | Exception](1)
     d._pending[1] = _Pending(send=send, receive=recv)  # pyright: ignore[reportPrivateUsage]
     recv.close()  # waiter gone - send_nowait will raise BrokenResourceError
     d._resolve_pending(1, {"late": True})  # pyright: ignore[reportPrivateUsage]
@@ -1854,7 +1854,7 @@ def test_fan_out_closed_drops_signal_when_waiter_already_has_outcome():
     c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](1)
     s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](1)
     d: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(s2c_recv, c2s_send)
-    send, recv = anyio.create_memory_object_stream[dict[str, Any] | ErrorData](1)
+    send, recv = anyio.create_memory_object_stream[dict[str, Any] | ErrorData | Exception](1)
     d._pending[1] = _Pending(send=send, receive=recv)  # pyright: ignore[reportPrivateUsage]
     send.send_nowait({"real": "result"})
     d._fan_out_closed()  # pyright: ignore[reportPrivateUsage]
